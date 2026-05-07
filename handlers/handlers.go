@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +14,27 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+const (
+	NS1_IP       = "192.168.1.12"
+	NS1_PORT     = "22"
+	WEB3_IP      = "192.168.1.13"
+	WEB3_PORT    = "22"
+	SSH_USER     = "nicolas"
+	ZONE_FILE    = "/etc/bind/db.cloud.local"
+	INTERNAL_NET = "intnet"
+	DNS_INTERNAL = "192.168.10.10"
+	GATEWAY      = "192.168.10.1"
+	NETMASK      = "255.255.255.0"
+)
+
+// Ruta al disco .vdi de web3 — ajusta si es diferente
+var BASE_DISK_PATH = `C:\Users\NICOLAS PEÑA RINCON\VirtualBox VMs\web3\web3-disk1.vdi`
 
 // ─── Models ───────────────────────────────────────────────────────────────────
 
@@ -21,12 +42,12 @@ type Instance struct {
 	Host      string    `json:"host"`
 	IP        string    `json:"ip"`
 	URL       string    `json:"url"`
-	State     string    `json:"state"` // "Activo" | "Inactivo"
+	State     string    `json:"state"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
 type StatusInfo struct {
-	VirtualBox string `json:"virtualbox"` // "OK" | "ERROR"
+	VirtualBox string `json:"virtualbox"`
 	VBoxDetail string `json:"vbox_detail"`
 	DNS        string `json:"dns"`
 	DNSDetail  string `json:"dns_detail"`
@@ -60,7 +81,6 @@ func addLog(level, msg string) {
 
 // ─── IP allocation ────────────────────────────────────────────────────────────
 
-// IPs para nuevas instancias Apache: empieza en .32 (web1=.30 es la plantilla)
 func nextAvailableIP() (string, error) {
 	used := map[string]bool{}
 	for _, inst := range instances {
@@ -75,14 +95,42 @@ func nextAvailableIP() (string, error) {
 	return "", fmt.Errorf("no hay IPs disponibles en el rango")
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── SSH helper ───────────────────────────────────────────────────────────────
 
-func runScript(name string, args ...string) (string, error) {
-	scriptPath := filepath.Join("scripts", name)
-	cmd := exec.Command("bash", append([]string{scriptPath}, args...)...)
+func sshRun(host, port, cmd string) (string, error) {
+	config := &ssh.ClientConfig{
+		User: SSH_USER,
+		Auth: []ssh.AuthMethod{
+			ssh.Password("nicolas"), // reemplaza por tu contraseña real
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         15 * time.Second,
+	}
+	client, err := ssh.Dial("tcp", host+":"+port, config)
+	if err != nil {
+		return "", fmt.Errorf("error conectando SSH a %s: %w", host, err)
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("error creando sesión SSH: %w", err)
+	}
+	defer session.Close()
+
+	out, err := session.CombinedOutput(cmd)
+	return string(out), err
+}
+
+// ─── VBoxManage helper ────────────────────────────────────────────────────────
+
+func vbox(args ...string) (string, error) {
+	cmd := exec.Command("vboxmanage", args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
+
+// ─── Helpers HTTP ─────────────────────────────────────────────────────────────
 
 func corsHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -122,19 +170,19 @@ func GetStatus(w http.ResponseWriter, r *http.Request) {
 		s.VBoxDetail = fmt.Sprintf("%d VM(s) corriendo", count)
 	}
 
-	// DNS bind9 — check port 53 on ns1
-	connDNS, errDNS := net.DialTimeout("tcp", "192.168.1.12:53", 2*time.Second)
+	// DNS
+	connDNS, errDNS := net.DialTimeout("tcp", NS1_IP+":53", 2*time.Second)
 	if errDNS != nil {
 		s.DNS = "ERROR"
-		s.DNSDetail = "ns1 (192.168.1.12) no responde en puerto 53"
+		s.DNSDetail = "ns1 no responde en puerto 53"
 	} else {
 		connDNS.Close()
 		s.DNS = "OK"
 		s.DNSDetail = "ns1.cloud.local activo"
 	}
 
-	// Apache plantilla — check web3
-	connWeb, errWeb := net.DialTimeout("tcp", "192.168.1.13:80", 2*time.Second)
+	// Apache
+	connWeb, errWeb := net.DialTimeout("tcp", WEB3_IP+":80", 2*time.Second)
 	if errWeb != nil {
 		s.Apache = "ERROR"
 		s.ApacheMsg = "Plantilla base no encontrada"
@@ -156,12 +204,10 @@ func GetInstances(w http.ResponseWriter, r *http.Request) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-
-	resp := map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"instances": instances,
 		"logs":      logs,
-	}
-	writeJSON(w, http.StatusOK, resp)
+	})
 }
 
 // ─── POST /api/provision ─────────────────────────────────────────────────────
@@ -176,20 +222,17 @@ func Provision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse multipart (max 50 MB)
 	if err := r.ParseMultipartForm(50 << 20); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "error al parsear formulario"})
 		return
 	}
 
-	host := strings.TrimSpace(r.FormValue("host"))
+	host := strings.ToLower(strings.TrimSpace(r.FormValue("host")))
+	host = strings.ReplaceAll(host, " ", "-")
 	if host == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "nombre de host requerido"})
 		return
 	}
-	// Sanitize host
-	host = strings.ToLower(host)
-	host = strings.ReplaceAll(host, " ", "-")
 
 	file, fh, err := r.FormFile("zip")
 	if err != nil {
@@ -204,7 +247,6 @@ func Provision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.Lock()
-	// Check duplicate
 	for _, inst := range instances {
 		if inst.Host == host {
 			mu.Unlock()
@@ -212,7 +254,6 @@ func Provision(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
 	ip, err := nextAvailableIP()
 	if err != nil {
 		mu.Unlock()
@@ -221,7 +262,7 @@ func Provision(w http.ResponseWriter, r *http.Request) {
 	}
 	mu.Unlock()
 
-	// Save zip to /tmp
+	// Guardar zip
 	zipPath := filepath.Join(os.TempDir(), fh.Filename)
 	dst, err := os.Create(zipPath)
 	if err != nil {
@@ -231,44 +272,43 @@ func Provision(w http.ResponseWriter, r *http.Request) {
 	io.Copy(dst, file)
 	dst.Close()
 
-	// Run provisioning in background
 	go func() {
 		mu.Lock()
 		addLog("INFO", fmt.Sprintf("Iniciando aprovisionamiento de '%s.cloud.local' (IP: %s)...", host, ip))
 		mu.Unlock()
 
-		// 1. Create VM
-		out, err := runScript("provision.sh", host, ip)
-		mu.Lock()
-		if err != nil {
-			addLog("ERROR", fmt.Sprintf("Error al crear VM '%s': %s", host, strings.TrimSpace(out)))
+		// 1. Crear VM
+		if err := provisionVM(host, ip); err != nil {
+			mu.Lock()
+			addLog("ERROR", fmt.Sprintf("Error al crear VM '%s': %v", host, err))
 			mu.Unlock()
 			return
 		}
+		mu.Lock()
 		addLog("INFO", fmt.Sprintf("Instancia '%s.cloud.local' (IP: %s) aprovisionada con éxito.", host, ip))
 		mu.Unlock()
 
-		// 2. Register DNS
-		out, err = runScript("dns_add.sh", host, ip)
-		mu.Lock()
-		if err != nil {
-			addLog("ERROR", fmt.Sprintf("Error al registrar DNS para '%s': %s", host, strings.TrimSpace(out)))
+		// 2. Registrar DNS
+		if err := dnsAdd(host, ip); err != nil {
+			mu.Lock()
+			addLog("ERROR", fmt.Sprintf("Error al registrar DNS para '%s': %v", host, err))
 			mu.Unlock()
 			return
 		}
+		mu.Lock()
 		addLog("INFO", fmt.Sprintf("Registro DNS '%s.cloud.local' → %s creado.", host, ip))
 		mu.Unlock()
 
-		// 3. Deploy zip
-		out, err = runScript("deploy.sh", host, ip, zipPath)
-		mu.Lock()
-		if err != nil {
-			addLog("ERROR", fmt.Sprintf("Error al desplegar contenido en '%s': %s", host, strings.TrimSpace(out)))
+		// 3. Desplegar zip
+		if err := deployZip(host, ip, zipPath); err != nil {
+			mu.Lock()
+			addLog("ERROR", fmt.Sprintf("Error al desplegar contenido en '%s': %v", host, err))
 			mu.Unlock()
 			return
 		}
-		addLog("INFO", fmt.Sprintf("Instancia '%s.cloud.local' (IP: %s) publicada con éxito.", host, ip))
 
+		mu.Lock()
+		addLog("INFO", fmt.Sprintf("Instancia '%s.cloud.local' (IP: %s) publicada con éxito.", host, ip))
 		instances = append(instances, Instance{
 			Host:      host,
 			IP:        ip + "/24",
@@ -285,7 +325,210 @@ func Provision(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ─── POST /api/instances/start ────────────────────────────────────────────────
+// ─── Provisioning ─────────────────────────────────────────────────────────────
+
+func provisionVM(host, ip string) error {
+	vmName := "apache-" + host
+
+	// Crear VM
+	if _, err := vbox("createvm", "--name", vmName, "--ostype", "Debian_64", "--register"); err != nil {
+		return fmt.Errorf("createvm: %w", err)
+	}
+
+	// Configurar hardware — solo red interna
+	if _, err := vbox("modifyvm", vmName,
+		"--memory", "512",
+		"--cpus", "1",
+		"--nic1", "intnet",
+		"--intnet1", INTERNAL_NET,
+		"--boot1", "disk",
+		"--boot2", "none",
+		"--boot3", "none",
+		"--boot4", "none",
+	); err != nil {
+		return fmt.Errorf("modifyvm: %w", err)
+	}
+
+	// Controlador SATA
+	if _, err := vbox("storagectl", vmName, "--name", "SATA Controller", "--add", "sata", "--controller", "IntelAhci"); err != nil {
+		return fmt.Errorf("storagectl: %w", err)
+	}
+
+	// Adjuntar disco multiconexión
+	if _, err := vbox("storageattach", vmName,
+		"--storagectl", "SATA Controller",
+		"--port", "0",
+		"--device", "0",
+		"--type", "hdd",
+		"--medium", BASE_DISK_PATH,
+		"--mtype", "multiattach",
+	); err != nil {
+		return fmt.Errorf("storageattach: %w", err)
+	}
+
+	// Arrancar headless
+	if _, err := vbox("startvm", vmName, "--type", "headless"); err != nil {
+		return fmt.Errorf("startvm: %w", err)
+	}
+
+	// Esperar que arranque
+	log.Printf("[INFO] Esperando que '%s' arranque...", vmName)
+	time.Sleep(25 * time.Second)
+
+	// Configurar hostname e IP via SSH a web3 (la nueva VM arranca con la misma IP de web3)
+	configCmd := fmt.Sprintf(`
+sudo hostnamectl set-hostname %s.cloud.local
+sudo tee /etc/network/interfaces > /dev/null <<'EOF'
+auto lo
+iface lo inet loopback
+auto enp0s3
+iface enp0s3 inet static
+    address %s
+    netmask %s
+    gateway %s
+    dns-nameservers %s
+EOF
+sudo tee /etc/resolv.conf > /dev/null <<'EOF2'
+nameserver %s
+EOF2
+sudo systemctl restart networking
+sudo systemctl restart apache2
+`, host+".cloud.local", ip, NETMASK, GATEWAY, DNS_INTERNAL, DNS_INTERNAL)
+
+	if _, err := sshRun(WEB3_IP, WEB3_PORT, configCmd); err != nil {
+		return fmt.Errorf("ssh config: %w", err)
+	}
+
+	return nil
+}
+
+// ─── DNS ──────────────────────────────────────────────────────────────────────
+
+func dnsAdd(host, ip string) error {
+	cmd := fmt.Sprintf(`
+SERIAL=$(grep -oP '\d+' /etc/bind/db.cloud.local | head -1)
+NEW_SERIAL=$((SERIAL + 1))
+sudo sed -i "s/$SERIAL/$NEW_SERIAL/" %s
+if ! grep -q '^%s[[:space:]]' %s; then
+    echo '%s    IN  A   %s' | sudo tee -a %s > /dev/null
+fi
+sudo rndc reload cloud.local
+`, ZONE_FILE, host, ZONE_FILE, host, ip, ZONE_FILE)
+
+	_, err := sshRun(NS1_IP, NS1_PORT, cmd)
+	return err
+}
+
+func dnsRemove(host string) error {
+	cmd := fmt.Sprintf(`
+SERIAL=$(grep -oP '\d+' /etc/bind/db.cloud.local | head -1)
+NEW_SERIAL=$((SERIAL + 1))
+sudo sed -i "s/$SERIAL/$NEW_SERIAL/" %s
+sudo sed -i '/^%s[[:space:]]/d' %s
+sudo rndc reload cloud.local
+`, ZONE_FILE, host, ZONE_FILE)
+
+	_, err := sshRun(NS1_IP, NS1_PORT, cmd)
+	return err
+}
+
+// ─── Deploy ───────────────────────────────────────────────────────────────────
+
+func deployZip(host, ip, zipPath string) error {
+	// Esperar SSH en la nueva instancia (IP interna)
+	log.Printf("[INFO] Esperando SSH en %s...", ip)
+	var sshReady bool
+	for i := 0; i < 12; i++ {
+		conn, err := net.DialTimeout("tcp", ip+":22", 3*time.Second)
+		if err == nil {
+			conn.Close()
+			sshReady = true
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+	if !sshReady {
+		return fmt.Errorf("la instancia %s no respondió SSH en 60s", ip)
+	}
+
+	// Leer zip y extraer index.html y demás archivos
+	webRoot := "/var/www/html/" + host
+
+	// Crear directorio y configurar Apache via SSH
+	setupCmd := fmt.Sprintf(`sudo mkdir -p %s && sudo chown -R www-data:www-data %s`, webRoot, webRoot)
+	if _, err := sshRun(ip, "22", setupCmd); err != nil {
+		return fmt.Errorf("error creando directorio web: %w", err)
+	}
+
+	// Leer y transferir archivos del zip via SSH
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("error abriendo zip: %w", err)
+	}
+	defer r.Close()
+
+	config := &ssh.ClientConfig{
+		User:            SSH_USER,
+		Auth:            []ssh.AuthMethod{ssh.Password("nicolas")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         15 * time.Second,
+	}
+	client, err := ssh.Dial("tcp", ip+":22", config)
+	if err != nil {
+		return fmt.Errorf("error SSH a nueva instancia: %w", err)
+	}
+	defer client.Close()
+
+	for _, f := range r.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		content, _ := io.ReadAll(rc)
+		rc.Close()
+
+		destPath := webRoot + "/" + f.Name
+		session, err := client.NewSession()
+		if err != nil {
+			continue
+		}
+		stdin, _ := session.StdinPipe()
+		session.Start(fmt.Sprintf("sudo tee %s > /dev/null", destPath))
+		stdin.Write(content)
+		stdin.Close()
+		session.Wait()
+		session.Close()
+	}
+
+	// Configurar VirtualHost Apache
+	vhostCmd := fmt.Sprintf(`
+sudo tee /etc/apache2/sites-available/%s.conf > /dev/null <<'EOF'
+<VirtualHost *:80>
+    ServerName %s.cloud.local
+    DocumentRoot %s
+    <Directory %s>
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+EOF
+sudo a2ensite %s.conf
+sudo a2dissite 000-default.conf 2>/dev/null || true
+sudo systemctl reload apache2
+`, host, host, webRoot, webRoot, host)
+
+	if _, err := sshRun(ip, "22", vhostCmd); err != nil {
+		return fmt.Errorf("error configurando Apache: %w", err)
+	}
+
+	return nil
+}
+
+// ─── Start / Stop / Delete ───────────────────────────────────────────────────
 
 func StartInstance(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -302,9 +545,8 @@ func StartInstance(w http.ResponseWriter, r *http.Request) {
 
 	for i, inst := range instances {
 		if inst.Host == body.Host {
-			out, err := runScript("vm_power.sh", inst.Host, "start")
-			if err != nil {
-				addLog("ERROR", fmt.Sprintf("Error al encender '%s': %s", inst.Host, strings.TrimSpace(out)))
+			if _, err := vbox("startvm", "apache-"+inst.Host, "--type", "headless"); err != nil {
+				addLog("ERROR", fmt.Sprintf("Error al encender '%s': %v", inst.Host, err))
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "no se pudo encender la VM"})
 				return
 			}
@@ -316,8 +558,6 @@ func StartInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusNotFound, map[string]string{"error": "instancia no encontrada"})
 }
-
-// ─── POST /api/instances/stop ─────────────────────────────────────────────────
 
 func StopInstance(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -334,9 +574,8 @@ func StopInstance(w http.ResponseWriter, r *http.Request) {
 
 	for i, inst := range instances {
 		if inst.Host == body.Host {
-			out, err := runScript("vm_power.sh", inst.Host, "stop")
-			if err != nil {
-				addLog("ERROR", fmt.Sprintf("Error al apagar '%s': %s", inst.Host, strings.TrimSpace(out)))
+			if _, err := vbox("controlvm", "apache-"+inst.Host, "acpipowerbutton"); err != nil {
+				addLog("ERROR", fmt.Sprintf("Error al apagar '%s': %v", inst.Host, err))
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "no se pudo apagar la VM"})
 				return
 			}
@@ -348,8 +587,6 @@ func StopInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusNotFound, map[string]string{"error": "instancia no encontrada"})
 }
-
-// ─── DELETE /api/instances/delete ─────────────────────────────────────────────
 
 func DeleteInstance(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
@@ -366,13 +603,15 @@ func DeleteInstance(w http.ResponseWriter, r *http.Request) {
 
 	for i, inst := range instances {
 		if inst.Host == body.Host {
-			// Remove VM
-			out, err := runScript("provision.sh", inst.Host, inst.IP, "delete")
-			if err != nil {
-				addLog("ERROR", fmt.Sprintf("Error al eliminar VM '%s': %s", inst.Host, strings.TrimSpace(out)))
+			// Apagar y eliminar VM
+			vbox("controlvm", "apache-"+inst.Host, "poweroff")
+			time.Sleep(2 * time.Second)
+			vbox("unregistervm", "apache-"+inst.Host, "--delete")
+
+			// Eliminar DNS
+			if err := dnsRemove(inst.Host); err != nil {
+				addLog("ERROR", fmt.Sprintf("Error eliminando DNS de '%s': %v", inst.Host, err))
 			}
-			// Remove DNS
-			runScript("dns_remove.sh", inst.Host)
 
 			instances = append(instances[:i], instances[i+1:]...)
 			addLog("INFO", fmt.Sprintf("Instancia '%s.cloud.local' (IP: %s) eliminada con éxito.", inst.Host, inst.IP))
