@@ -8,11 +8,11 @@ IP="$2"
 ACTION="${3:-create}"
 
 TEMPLATE_VM="web1"
-BASE_DISK_PATH="/home/$(whoami)/VirtualBox VMs/web1/web1.vmdk"  # ajustar si difiere
+BASE_DISK_PATH="/home/$(whoami)/VirtualBox VMs/web3/web3-disk1.vdi"  # ajustar si difiere
 VM_NAME="apache-${HOST}"
 INTERNAL_NET="intnet"
 GATEWAY="192.168.10.1"
-DNS="192.168.10.20"
+DNS="192.168.10.10"
 NETMASK="255.255.255.0"
 
 if [ "$ACTION" = "delete" ]; then
@@ -65,7 +65,7 @@ sleep 20
 #    Usamos SSH a web1 (plantilla) para conocer la IP inicial — en multiattach la VM arranca con la misma config.
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
-TEMPLATE_IP="192.168.10.30"
+TEMPLATE_IP="192.168.1.13"
 
 echo "[INFO] Configurando hostname e IP en la nueva instancia..."
 ssh $SSH_OPTS usuario@"$TEMPLATE_IP" "

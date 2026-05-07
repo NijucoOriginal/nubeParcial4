@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -122,25 +123,25 @@ func GetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// DNS bind9 — check port 53 on ns1
-	out2, err2 := exec.Command("bash", "-c",
-		"nc -z -w2 192.168.10.10 53 && echo OK || echo FAIL").CombinedOutput()
-	if err2 != nil || strings.TrimSpace(string(out2)) != "OK" {
+	connDNS, errDNS := net.DialTimeout("tcp", "192.168.1.12:53", 2*time.Second)
+	if errDNS != nil {
 		s.DNS = "ERROR"
-		s.DNSDetail = "ns1 (192.168.10.10) no responde en puerto 53"
+		s.DNSDetail = "ns1 (192.168.1.12) no responde en puerto 53"
 	} else {
+		connDNS.Close()
 		s.DNS = "OK"
 		s.DNSDetail = "ns1.cloud.local activo"
 	}
 
-	// Apache plantilla — check web1
-	out3, err3 := exec.Command("bash", "-c",
-		"nc -z -w2 192.168.10.30 80 && echo OK || echo FAIL").CombinedOutput()
-	if err3 != nil || strings.TrimSpace(string(out3)) != "OK" {
+	// Apache plantilla — check web3
+	connWeb, errWeb := net.DialTimeout("tcp", "192.168.1.13:80", 2*time.Second)
+	if errWeb != nil {
 		s.Apache = "ERROR"
 		s.ApacheMsg = "Plantilla base no encontrada"
 	} else {
+		connWeb.Close()
 		s.Apache = "OK"
-		s.ApacheMsg = "web1.cloud.local activo"
+		s.ApacheMsg = "web3.cloud.local activo"
 	}
 
 	writeJSON(w, http.StatusOK, s)
@@ -221,7 +222,7 @@ func Provision(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	// Save zip to /tmp
-	zipPath := filepath.Join("/tmp", fh.Filename)
+	zipPath := filepath.Join(os.TempDir(), fh.Filename)
 	dst, err := os.Create(zipPath)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "no se pudo guardar el zip"})

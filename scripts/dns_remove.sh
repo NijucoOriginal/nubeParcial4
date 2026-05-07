@@ -5,7 +5,7 @@ set -euo pipefail
 
 HOST="$1"
 
-NS1_IP="192.168.10.10"
+NS1_IP="192.168.1.12"
 ZONE_FILE="/etc/bind/db.cloud.local"
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
