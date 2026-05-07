@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>CompuNube — Gestión HTTP</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
+<style>
+:root {
+  --bg:        #e8ede8;
+  --panel:     #d4daf5;
+  --panel2:    #c8cfed;
+  --white:     #f5f7f5;
+  --green-ok:  #7ec87e;
+  --green-btn: #6bbf6b;
+  --red-no:    #e05050;
+  --red-del:   #d94444;
+  --orange:    #e8924a;
+  --text:      #1a1f1a;
+  --text-dim:  #4a524a;
+  --border:    #b0bab0;
+  --mono:      'Space Mono', monospace;
+  --sans:      'DM Sans', sans-serif;
+  --radius:    10px;
+  --shadow:    0 2px 12px rgba(0,0,0,0.10);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  padding: 0 0 48px;
+}
+
+/* ── Header ── */
+.header {
+  background: var(--bg);
+  padding: 28px 40px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 2px solid var(--border);
+}
+.header h1 {
+  font-family: var(--sans);
+  font-size: 2rem;
+  font-weight: 600;
+  letter-spacing: -0.5px;
+}
+.header-icon {
+  font-size: 2.2rem;
+  opacity: 0.6;
+}
+
+/* ── Main layout ── */
+.main { padding: 28px 40px 0; }
+
+/* ── Top panel ── */
+.top-panel {
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 28px 32px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 32px;
+  margin-bottom: 28px;
+  box-shadow: var(--shadow);
+}
+
+.form-section { display: flex; flex-direction: column; gap: 20px; }
+
+.field-group label {
+  display: block;
+  font-weight: 500;
+  font-size: 1.05rem;
+  margin-bottom: 8px;
+  color: var(--text-dim);
+}
+.field-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.field-row input[type="text"],
+.field-row input[type="file"] {
+  flex: 1;
+  padding: 10px 14px;
+  background: var(--white);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--sans);
+  font-size: 0.95rem;
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.2s;
+}
+.field-row input[type="text"]:focus { border-color: #8899cc; }
+
+/* file input styling */
+.file-label {
+  flex: 1;
+  padding: 10px 14px;
+  background: var(--white);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.95rem;
+  color: var(--text-dim);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: border-color 0.2s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-label:hover { border-color: #8899cc; }
+#fileInput { display: none; }
+
+.btn {
+  padding: 10px 22px;
+  border: none;
+  border-radius: 40px;
+  font-family: var(--sans);
+  font-size: 0.92rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+  white-space: nowrap;
+}
+.btn:hover { opacity: 0.88; transform: translateY(-1px); }
+.btn:active { transform: translateY(0); }
+.btn-accept { background: var(--green-btn); color: #fff; }
+.btn-publish { background: var(--green-btn); color: #fff; }
+.btn-start  { background: var(--green-btn); color: #fff; padding: 6px 16px; font-size: 0.82rem; }
+.btn-stop   { background: var(--orange); color: #fff; padding: 6px 16px; font-size: 0.82rem; }
+.btn-delete { background: var(--red-del); color: #fff; padding: 6px 16px; font-size: 0.82rem; }
+
+/* ── Status panel ── */
+.status-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 260px;
+}
+.status-card {
+  background: var(--white);
+  border-radius: 8px;
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.07);
+}
+.status-card-name {
+  font-weight: 600;
+  font-size: 0.88rem;
+  color: var(--text-dim);
+  flex: 1;
+}
+.status-card-detail {
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  text-align: right;
+  flex: 1;
+}
+.badge {
+  padding: 4px 14px;
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+.badge-ok  { background: var(--green-ok); color: #fff; }
+.badge-err { background: var(--red-no); color: #fff; }
+
+/* ── Bottom panel ── */
+.bottom-panel {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  background: var(--panel);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: var(--shadow);
+}
+
+.section-title {
+  background: #b8bfd8;
+  padding: 14px 20px;
+  font-weight: 600;
+  font-size: 1.05rem;
+  color: var(--text);
+}
+
+/* ── Instances table ── */
+.instances-section { border-right: 2px solid var(--border); }
+
+.table-wrap { overflow-x: auto; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+thead th {
+  padding: 10px 16px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1.5px solid var(--border);
+}
+tbody tr {
+  border-bottom: 1px solid rgba(0,0,0,0.06);
+  transition: background 0.1s;
+}
+tbody tr:hover { background: rgba(255,255,255,0.4); }
+tbody td { padding: 10px 16px; }
+.url-link {
+  color: #3355bb;
+  text-decoration: none;
+  font-weight: 500;
+}
+.url-link:hover { text-decoration: underline; }
+.empty-row td {
+  text-align: center;
+  color: var(--text-dim);
+  padding: 32px;
+  font-style: italic;
+}
+
+/* ── Monitor section ── */
+.monitor-section {}
+
+.monitor-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1.5px solid var(--border);
+}
+.tab {
+  padding: 10px 20px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.15s;
+  color: var(--text-dim);
+}
+.tab.active {
+  border-bottom-color: #5566cc;
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Table monitor */
+.monitor-table-view table { font-size: 0.83rem; }
+.state-active   { background: var(--green-ok); color: #fff; }
+.state-inactive { background: var(--red-no); color: #fff; }
+.state-badge {
+  padding: 3px 10px;
+  border-radius: 5px;
+  font-weight: 600;
+  font-size: 0.78rem;
+}
+.actions-cell { display: flex; gap: 6px; }
+
+/* Log terminal */
+.log-terminal {
+  background: #1a1f1a;
+  color: #b8f0b8;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  line-height: 1.7;
+  padding: 16px;
+  min-height: 200px;
+  max-height: 280px;
+  overflow-y: auto;
+  display: none;
+}
+.log-terminal.active { display: block; }
+.log-entry { margin-bottom: 2px; }
+.log-info  { color: #b8f0b8; }
+.log-error { color: #f09898; }
+.log-warn  { color: #f0d098; }
+.log-empty { color: #4a6a4a; font-style: italic; }
+
+/* notification toast */
+.toast {
+  position: fixed;
+  bottom: 28px;
+  right: 28px;
+  padding: 14px 22px;
+  border-radius: 10px;
+  font-weight: 500;
+  font-size: 0.9rem;
+  color: #fff;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.18);
+  z-index: 999;
+  opacity: 0;
+  transform: translateY(12px);
+  transition: all 0.3s;
+  pointer-events: none;
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast.success { background: #3a8a3a; }
+.toast.error   { background: #a03030; }
+.toast.info    { background: #3355bb; }
+
+/* spinner */
+.spinner {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border: 2px solid rgba(255,255,255,0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.monitor-table-view { display: block; }
+.monitor-table-view.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Gestión de páginas y aplicaciones web.</h1>
+  <span class="header-icon">⚙️</span>
+</div>
+
+<div class="main">
+
+  <!-- ── Top panel ── -->
+  <div class="top-panel">
+    <div class="form-section">
+
+      <div class="field-group">
+        <label>Nombre del host</label>
+        <div class="field-row">
+          <input type="text" id="hostInput" placeholder="ej: paisajes" autocomplete="off"/>
+          <button class="btn btn-accept" onclick="submitHost()">Aceptar</button>
+        </div>
+      </div>
+
+      <div class="field-group">
+        <label>Contenido web (comprimido)</label>
+        <div class="field-row">
+          <label class="file-label" id="fileLabel" for="fileInput">
+            📁 Seleccionar archivo .zip…
+          </label>
+          <input type="file" id="fileInput" accept=".zip" onchange="onFileChange(this)"/>
+          <button class="btn btn-publish" id="publishBtn" onclick="publish()">Publicar</button>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Status cards -->
+    <div class="status-panel" id="statusPanel">
+      <div class="status-card">
+        <span class="status-card-name">VirtualBox</span>
+        <span class="badge badge-ok" id="st-vbox">OK</span>
+        <span class="status-card-detail" id="st-vbox-detail">—</span>
+      </div>
+      <div class="status-card">
+        <span class="status-card-name">Servidor DNS bind</span>
+        <span class="badge badge-ok" id="st-dns">OK</span>
+        <span class="status-card-detail" id="st-dns-detail">—</span>
+      </div>
+      <div class="status-card">
+        <span class="status-card-name">Apache HTTP</span>
+        <span class="badge badge-ok" id="st-apache">OK</span>
+        <span class="status-card-detail" id="st-apache-detail">—</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Bottom panel ── -->
+  <div class="bottom-panel">
+
+    <!-- Instances -->
+    <div class="instances-section">
+      <div class="section-title">Instancias disponibles</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>URL</th>
+              <th>Dirección IP</th>
+              <th>Host</th>
+            </tr>
+          </thead>
+          <tbody id="instancesBody">
+            <tr class="empty-row"><td colspan="3">Sin instancias activas</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Monitor -->
+    <div class="monitor-section">
+      <div class="section-title">Monitorización</div>
+
+      <div class="monitor-tabs">
+        <div class="tab active" onclick="switchTab('table', this)">Estado</div>
+        <div class="tab" onclick="switchTab('logs', this)">Logs</div>
+      </div>
+
+      <!-- Table view -->
+      <div class="monitor-table-view" id="monitorTable">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Fecha</th>
+                <th>Estado</th>
+                <th>Acciones</th>
+              </tr>
+            </thead>
+            <tbody id="monitorBody">
+              <tr class="empty-row"><td colspan="3">Sin instancias</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Log terminal -->
+      <div class="log-terminal" id="logTerminal">
+        <span class="log-empty">[ sin registros aún ]</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '';  // mismo origen
+
+// ── Estado local ──────────────────────────────────────────────────────────────
+let pendingHost = '';
+let instances = [];
+let logLines  = [];
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  refreshStatus();
+  refreshInstances();
+  setInterval(refreshStatus, 10000);
+  setInterval(refreshInstances, 4000);
+});
+
+// ── File picker ───────────────────────────────────────────────────────────────
+function onFileChange(input) {
+  const label = document.getElementById('fileLabel');
+  label.textContent = input.files.length > 0 ? input.files[0].name : '📁 Seleccionar archivo .zip…';
+}
+
+// ── Aceptar host ──────────────────────────────────────────────────────────────
+function submitHost() {
+  const val = document.getElementById('hostInput').value.trim();
+  if (!val) { showToast('Ingresa un nombre de host.', 'error'); return; }
+  pendingHost = val.toLowerCase().replace(/\s+/g, '-');
+  showToast(`Host "${pendingHost}" listo. Ahora selecciona el .zip y haz clic en Publicar.`, 'info');
+}
+
+// ── Publicar ──────────────────────────────────────────────────────────────────
+async function publish() {
+  if (!pendingHost) { showToast('Primero ingresa y acepta un nombre de host.', 'error'); return; }
+  const fileInput = document.getElementById('fileInput');
+  if (!fileInput.files.length) { showToast('Selecciona un archivo .zip.', 'error'); return; }
+
+  const btn = document.getElementById('publishBtn');
+  btn.innerHTML = '<span class="spinner"></span>Publicando…';
+  btn.disabled = true;
+
+  const fd = new FormData();
+  fd.append('host', pendingHost);
+  fd.append('zip', fileInput.files[0]);
+
+  try {
+    const res = await fetch(`${API}/api/provision`, { method: 'POST', body: fd });
+    const data = await res.json();
+    if (res.ok) {
+      showToast(`Aprovisionamiento de "${pendingHost}.cloud.local" iniciado. IP: ${data.ip}`, 'success');
+      document.getElementById('hostInput').value = '';
+      document.getElementById('fileInput').value = '';
+      document.getElementById('fileLabel').textContent = '📁 Seleccionar archivo .zip…';
+      pendingHost = '';
+    } else {
+      showToast(data.error || 'Error al publicar.', 'error');
+    }
+  } catch (e) {
+    showToast('No se pudo conectar con el servidor.', 'error');
+  } finally {
+    btn.innerHTML = 'Publicar';
+    btn.disabled = false;
+  }
+}
+
+// ── Status ─────────────────────────────────────────────────────────────────────
+async function refreshStatus() {
+  try {
+    const res = await fetch(`${API}/api/status`);
+    const s = await res.json();
+    setStatus('vbox',   s.virtualbox, s.vbox_detail);
+    setStatus('dns',    s.dns,        s.dns_detail);
+    setStatus('apache', s.apache,     s.apache_msg);
+  } catch {}
+}
+
+function setStatus(key, value, detail) {
+  const badge  = document.getElementById(`st-${key}`);
+  const detEl  = document.getElementById(`st-${key}-detail`);
+  const isOk   = value === 'OK';
+  badge.textContent = isOk ? 'OK' : 'NO';
+  badge.className = `badge ${isOk ? 'badge-ok' : 'badge-err'}`;
+  if (detEl) detEl.textContent = detail || '—';
+}
+
+// ── Instances ─────────────────────────────────────────────────────────────────
+async function refreshInstances() {
+  try {
+    const res = await fetch(`${API}/api/instances`);
+    const data = await res.json();
+    instances = data.instances || [];
+    logLines  = data.logs      || [];
+    renderInstances();
+    renderMonitor();
+    renderLogs();
+  } catch {}
+}
+
+function renderInstances() {
+  const tbody = document.getElementById('instancesBody');
+  if (!instances.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="3">Sin instancias activas</td></tr>';
+    return;
+  }
+  tbody.innerHTML = instances.map(inst => `
+    <tr>
+      <td><a class="url-link" href="${inst.url}" target="_blank">${inst.url}</a></td>
+      <td>${inst.ip}</td>
+      <td>${inst.host}</td>
+    </tr>
+  `).join('');
+}
+
+function renderMonitor() {
+  const tbody = document.getElementById('monitorBody');
+  if (!instances.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="3">Sin instancias</td></tr>';
+    return;
+  }
+  tbody.innerHTML = instances.map(inst => {
+    const active = inst.state === 'Activo';
+    const fecha  = new Date(inst.created_at).toLocaleString('es-CO');
+    const actions = active
+      ? `<button class="btn btn-stop"   onclick="stopInst('${inst.host}')">Apagar</button>
+         <button class="btn btn-delete" onclick="delInst('${inst.host}')">Eliminar</button>`
+      : `<button class="btn btn-start"  onclick="startInst('${inst.host}')">Encender</button>
+         <button class="btn btn-delete" onclick="delInst('${inst.host}')">Eliminar</button>`;
+    return `
+      <tr>
+        <td>${fecha}</td>
+        <td><span class="state-badge ${active ? 'state-active' : 'state-inactive'}">${inst.state}</span></td>
+        <td><div class="actions-cell">${actions}</div></td>
+      </tr>`;
+  }).join('');
+}
+
+function renderLogs() {
+  const terminal = document.getElementById('logTerminal');
+  if (!logLines.length) {
+    terminal.innerHTML = '<span class="log-empty">[ sin registros aún ]</span>';
+    return;
+  }
+  terminal.innerHTML = logLines.map(l => {
+    const cls = l.level === 'ERROR' ? 'log-error' : l.level === 'WARN' ? 'log-warn' : 'log-info';
+    return `<div class="log-entry ${cls}">[${l.timestamp}] [${l.level}] ${l.message}</div>`;
+  }).join('');
+  terminal.scrollTop = terminal.scrollHeight;
+}
+
+// ── Instance actions ──────────────────────────────────────────────────────────
+async function startInst(host) {
+  await apiPost('/api/instances/start', { host });
+}
+async function stopInst(host) {
+  await apiPost('/api/instances/stop', { host });
+}
+async function delInst(host) {
+  if (!confirm(`¿Eliminar instancia "${host}.cloud.local"?`)) return;
+  await apiDelete('/api/instances/delete', { host });
+}
+
+async function apiPost(url, body) {
+  try {
+    const res = await fetch(`${API}${url}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const d = await res.json();
+    showToast(d.message || d.error, res.ok ? 'success' : 'error');
+    refreshInstances();
+  } catch { showToast('Error de conexión.', 'error'); }
+}
+
+async function apiDelete(url, body) {
+  try {
+    const res = await fetch(`${API}${url}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const d = await res.json();
+    showToast(d.message || d.error, res.ok ? 'success' : 'error');
+    refreshInstances();
+  } catch { showToast('Error de conexión.', 'error'); }
+}
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function switchTab(tab, el) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  const tableView = document.getElementById('monitorTable');
+  const logView   = document.getElementById('logTerminal');
+  if (tab === 'table') {
+    tableView.classList.remove('hidden');
+    logView.classList.remove('active');
+  } else {
+    tableView.classList.add('hidden');
+    logView.classList.add('active');
+  }
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function showToast(msg, type = 'info') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = `toast ${type} show`;
+  setTimeout(() => { el.classList.remove('show'); }, 4000);
+}
+</script>
+</body>
+</html>
