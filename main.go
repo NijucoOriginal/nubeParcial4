@@ -9,6 +9,7 @@ import (
 
 func main() {
 	handlers.EnsureInfrastructure()
+	handlers.DetectVMIPs()
 	handlers.LoadIPCounter()
 	mux := http.NewServeMux()
 

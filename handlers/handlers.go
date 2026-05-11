@@ -20,9 +20,9 @@ import (
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const (
-	NS1_IP       = "192.168.1.12"
-	NS1_PORT     = "22"
-	WEB3_IP      = "192.168.1.13"
+	//NS1_IP       = "192.168.1.12"
+	NS1_PORT = "22"
+	//WEB3_IP      = "192.168.1.13"
 	WEB3_PORT    = "22"
 	SSH_USER     = "nicolas"
 	ZONE_FILE    = "/etc/bind/db.cloud.local"
@@ -30,6 +30,11 @@ const (
 	DNS_INTERNAL = "192.168.10.10"
 	GATEWAY      = "192.168.10.1"
 	NETMASK      = "255.255.255.0"
+)
+
+var (
+	NS1_IP  = ""
+	WEB3_IP = ""
 )
 
 const IP_COUNTER_FILE = "/tmp/ip_counter.txt"
@@ -336,24 +341,35 @@ func provisionVM(host, ip string) error {
 		return fmt.Errorf("createvm: %w", err)
 	}
 
+	// Configuración de red y hardware
 	if _, err := vbox("modifyvm", vmName,
 		"--memory", "512",
 		"--cpus", "1",
 		"--nic1", "intnet",
 		"--intnet1", INTERNAL_NET,
+		"--nic2", "bridged",
+		"--bridgeadapter2", "Realtek RTL8723BE 802.11 bgn Wi-Fi Adapter",
 		"--boot1", "disk",
-		"--boot2", "none",
+		"--boot2", "dvd",
 		"--boot3", "none",
 		"--boot4", "none",
 	); err != nil {
 		return fmt.Errorf("modifyvm: %w", err)
 	}
 
-	if _, err := vbox("storagectl", vmName, "--name", "SATA Controller", "--add", "sata", "--controller", "IntelAhci"); err != nil {
-		return fmt.Errorf("storagectl: %w", err)
+	// Controlador SATA
+	if _, err := vbox("storagectl",
+		vmName,
+		"--name", "SATA Controller",
+		"--add", "sata",
+		"--controller", "IntelAhci",
+	); err != nil {
+		return fmt.Errorf("storagectl SATA: %w", err)
 	}
 
-	if _, err := vbox("storageattach", vmName,
+	// Disco base multiattach
+	if _, err := vbox("storageattach",
+		vmName,
 		"--storagectl", "SATA Controller",
 		"--port", "0",
 		"--device", "0",
@@ -361,7 +377,28 @@ func provisionVM(host, ip string) error {
 		"--medium", BASE_DISK_PATH,
 		"--mtype", "multiattach",
 	); err != nil {
-		return fmt.Errorf("storageattach: %w", err)
+		return fmt.Errorf("storageattach HDD: %w", err)
+	}
+
+	// Controlador IDE para Guest Additions
+	if _, err := vbox("storagectl",
+		vmName,
+		"--name", "IDE Controller",
+		"--add", "ide",
+	); err != nil {
+		return fmt.Errorf("storagectl IDE: %w", err)
+	}
+
+	// Montar ISO de Guest Additions
+	if _, err := vbox("storageattach",
+		vmName,
+		"--storagectl", "IDE Controller",
+		"--port", "0",
+		"--device", "0",
+		"--type", "dvddrive",
+		"--medium", "C:\\Program Files\\Oracle\\VirtualBox\\VBoxGuestAdditions.iso",
+	); err != nil {
+		return fmt.Errorf("montando Guest Additions ISO: %w", err)
 	}
 
 	// Apagar web3 temporalmente
@@ -369,6 +406,7 @@ func provisionVM(host, ip string) error {
 	vbox("controlvm", "web3", "acpipowerbutton")
 	time.Sleep(30 * time.Second)
 
+	// Iniciar VM
 	if _, err := vbox("startvm", vmName, "--type", "headless"); err != nil {
 		return fmt.Errorf("startvm: %w", err)
 	}
@@ -376,64 +414,179 @@ func provisionVM(host, ip string) error {
 	log.Printf("[INFO] Esperando que '%s' arranque...", vmName)
 	time.Sleep(90 * time.Second)
 
-	// Configurar hostname e IP via túnel ns1 → nueva instancia (red interna)
+	// ============================================
+	// INSTALAR GUEST ADDITIONS
+	// ============================================
+
+	log.Printf("[INFO] Instalando Guest Additions en '%s'...", vmName)
+
 	config := &ssh.ClientConfig{
 		User:            SSH_USER,
 		Auth:            []ssh.AuthMethod{ssh.Password("nicolas")},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         15 * time.Second,
+		Timeout:         30 * time.Second,
 	}
 
-	ns1Client, err := ssh.Dial("tcp", NS1_IP+":"+NS1_PORT, config)
-	if err != nil {
-		return fmt.Errorf("error SSH a ns1: %w", err)
-	}
-	defer ns1Client.Close()
+	var vmClient *ssh.Client
+	var err error
 
-	// La nueva VM arrancó con la IP de web3 (192.168.10.30), entramos por ahí
-	vmConn, err := ns1Client.Dial("tcp", "192.168.10.30:22")
-	if err != nil {
-		return fmt.Errorf("error túnel ns1→nueva VM: %w", err)
+	// Intentar conectar varias veces
+	for i := 0; i < 10; i++ {
+		vmClient, err = ssh.Dial("tcp", ip+":22", config)
+		if err == nil {
+			break
+		}
+
+		log.Printf("[INFO] Esperando SSH (%d/10)...", i+1)
+		time.Sleep(10 * time.Second)
 	}
 
-	vmNConn, chans, reqs, err := ssh.NewClientConn(vmConn, "192.168.10.30:22", config)
 	if err != nil {
-		return fmt.Errorf("error SSH nueva VM via túnel: %w", err)
+		return fmt.Errorf("error SSH inicial a nueva VM: %w", err)
 	}
-	vmClient := ssh.NewClient(vmNConn, chans, reqs)
+
+	defer vmClient.Close()
+
+	sessionGA, err := vmClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("error creando sesión Guest Additions: %w", err)
+	}
+
+	guestCmd := `
+sudo apt-get update &&
+sudo apt-get install -y \
+	build-essential \
+	dkms \
+	linux-headers-$(uname -r) \
+	unzip \
+	apache2 &&
+
+sudo mkdir -p /mnt/cdrom &&
+sudo mount /dev/cdrom /mnt/cdrom || true &&
+
+sudo sh /mnt/cdrom/VBoxLinuxAdditions.run || true
+`
+
+	out, err := sessionGA.CombinedOutput(guestCmd)
+	sessionGA.Close()
+
+	if err != nil {
+		return fmt.Errorf("error instalando Guest Additions: %s: %w", string(out), err)
+	}
+
+	log.Printf("[INFO] Guest Additions instaladas correctamente")
+
+	// Reiniciar VM para activar VBoxService
+	log.Printf("[INFO] Reiniciando VM...")
+
+	rebootSession, err := vmClient.NewSession()
+	if err == nil {
+		rebootSession.Run("sudo reboot")
+		rebootSession.Close()
+	}
+
+	vmClient.Close()
+
+	// Esperar reinicio
+	time.Sleep(40 * time.Second)
+
+	// ============================================
+	// DETECTAR IP DE PUENTE
+	// ============================================
+
+	log.Printf("[INFO] Detectando IP de puente de '%s'...", vmName)
+
+	var bridgeIP string
+
+	for i := 0; i < 15; i++ {
+
+		out, err := exec.Command(
+			"vboxmanage",
+			"guestproperty",
+			"get",
+			vmName,
+			"/VirtualBox/GuestInfo/Net/1/V4/IP",
+		).CombinedOutput()
+
+		if err == nil {
+
+			parts := strings.Fields(string(out))
+
+			if len(parts) >= 2 && parts[0] == "Value:" {
+				bridgeIP = parts[1]
+
+				log.Printf("[INFO] IP de puente detectada: %s", bridgeIP)
+				break
+			}
+		}
+
+		log.Printf("[INFO] Esperando IP de puente (%d/15)...", i+1)
+		time.Sleep(10 * time.Second)
+	}
+
+	if bridgeIP == "" {
+		return fmt.Errorf("no se pudo detectar la IP de puente")
+	}
+
+	// ============================================
+	// CONFIGURAR RED INTERNA
+	// ============================================
+
+	vmClient, err = ssh.Dial("tcp", bridgeIP+":22", config)
+	if err != nil {
+		return fmt.Errorf("error SSH por bridge: %w", err)
+	}
+
 	defer vmClient.Close()
 
 	configCmd := fmt.Sprintf(`
 sudo hostnamectl set-hostname %s.cloud.local
+
 sudo tee /etc/network/interfaces > /dev/null <<'EOF'
 auto lo
 iface lo inet loopback
+
 auto enp0s3
 iface enp0s3 inet static
     address %s
     netmask %s
     dns-nameservers %s
+
+auto enp0s8
+iface enp0s8 inet dhcp
 EOF
+
 sudo tee /etc/resolv.conf > /dev/null <<'EOF2'
 nameserver %s
 EOF2
+
 nohup sudo systemctl restart networking > /dev/null 2>&1 &
 nohup sudo systemctl restart apache2 > /dev/null 2>&1 &
-`, host+".cloud.local", ip, NETMASK, DNS_INTERNAL, DNS_INTERNAL)
+`,
+		host+".cloud.local",
+		ip,
+		NETMASK,
+		DNS_INTERNAL,
+		DNS_INTERNAL,
+	)
 
 	session, err := vmClient.NewSession()
 	if err != nil {
-		return fmt.Errorf("error creando sesión en nueva VM: %w", err)
-	}
-	_, err = session.CombinedOutput(configCmd)
-	session.Close()
-	if err != nil {
-		return fmt.Errorf("error configurando nueva VM: %w", err)
+		return fmt.Errorf("error creando sesión configuración: %w", err)
 	}
 
-	// Encender web3
+	out, err = session.CombinedOutput(configCmd)
+	session.Close()
+
+	if err != nil {
+		return fmt.Errorf("error configurando VM: %s: %w", string(out), err)
+	}
+
+	// Encender web3 nuevamente
 	log.Printf("[INFO] Encendiendo web3...")
 	vbox("startvm", "web3", "--type", "headless")
+
+	log.Printf("[INFO] VM '%s' provisionada correctamente", vmName)
 
 	return nil
 }
@@ -471,6 +624,7 @@ sudo rndc reload cloud.local
 // ─── Deploy ───────────────────────────────────────────────────────────────────
 
 func deployZip(host, ip, zipPath string) error {
+	vmName := "apache-" + host
 	webRoot := "/var/www/html/" + host
 
 	// Leer el zip localmente
@@ -479,41 +633,45 @@ func deployZip(host, ip, zipPath string) error {
 		return fmt.Errorf("error leyendo zip: %w", err)
 	}
 
-	// Subir el zip a web3 via NS1 como salto intermedio
-	log.Printf("[INFO] Subiendo zip a web3 via ns1...")
+	// Detectar IP de puente de la nueva VM
+	log.Printf("[INFO] Detectando IP de puente de '%s' para deploy...", vmName)
+	var bridgeIP string
+	for i := 0; i < 10; i++ {
+		out, err := exec.Command("vboxmanage", "guestproperty", "get", vmName, "/VirtualBox/GuestInfo/Net/1/V4/IP").CombinedOutput()
+		if err == nil {
+			parts := strings.Fields(string(out))
+			if len(parts) >= 2 && parts[0] == "Value:" {
+				bridgeIP = parts[1]
+				log.Printf("[INFO] IP de puente para deploy: %s", bridgeIP)
+				break
+			}
+		}
+		log.Printf("[INFO] Esperando IP de puente para deploy (%d/10)...", i+1)
+		time.Sleep(10 * time.Second)
+	}
+	if bridgeIP == "" {
+		return fmt.Errorf("no se pudo detectar la IP de puente para el deploy")
+	}
+
+	// Conectar directamente a la nueva VM por su IP de puente
 	config := &ssh.ClientConfig{
 		User:            SSH_USER,
 		Auth:            []ssh.AuthMethod{ssh.Password("nicolas")},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         60 * time.Second,
+		Timeout:         30 * time.Second,
 	}
 
-	// Conectar a ns1
-	ns1Client, err := ssh.Dial("tcp", NS1_IP+":"+NS1_PORT, config)
+	client, err := ssh.Dial("tcp", bridgeIP+":22", config)
 	if err != nil {
-		return fmt.Errorf("error SSH a ns1: %w", err)
+		return fmt.Errorf("error SSH a nueva VM: %w", err)
 	}
-	defer ns1Client.Close()
+	defer client.Close()
 
-	// Desde ns1, abrir túnel hacia web3 por red interna
-	web3Conn, err := ns1Client.Dial("tcp", "192.168.10.30:22")
+	// Copiar zip directamente a la nueva VM
+	log.Printf("[INFO] Copiando zip a nueva VM...")
+	session, err := client.NewSession()
 	if err != nil {
-		return fmt.Errorf("error abriendo túnel ns1→web3: %w", err)
-	}
-
-	// Crear cliente SSH a web3 usando el túnel
-	web3NConn, chans, reqs, err := ssh.NewClientConn(web3Conn, "192.168.10.30:22", config)
-	if err != nil {
-		return fmt.Errorf("error SSH web3 via túnel: %w", err)
-	}
-	web3Client := ssh.NewClient(web3NConn, chans, reqs)
-	defer web3Client.Close()
-
-	// Copiar zip a web3
-	log.Printf("[INFO] Copiando zip a web3...")
-	session, err := web3Client.NewSession()
-	if err != nil {
-		return fmt.Errorf("error creando sesión en web3: %w", err)
+		return fmt.Errorf("error creando sesión: %w", err)
 	}
 	stdin, _ := session.StdinPipe()
 	session.Start("cat > /tmp/contenido.zip")
@@ -522,22 +680,7 @@ func deployZip(host, ip, zipPath string) error {
 	session.Wait()
 	session.Close()
 
-	// Esperar que la nueva instancia aplique su nueva IP
-	log.Printf("[INFO] Esperando que la nueva instancia tome IP %s...", ip)
-	time.Sleep(30 * time.Second)
-
-	// Verificar desde ns1 que la nueva IP ya responde
-	log.Printf("[INFO] Verificando conectividad a %s desde ns1...", ip)
-	for i := 0; i < 12; i++ {
-		out, _ := sshRun(NS1_IP, NS1_PORT, fmt.Sprintf("ping -c 1 -W 2 %s 2>/dev/null && echo OK || echo FAIL", ip))
-		if strings.Contains(out, "OK") {
-			log.Printf("[INFO] Nueva instancia %s responde ping.", ip)
-			break
-		}
-		log.Printf("[INFO] Esperando respuesta de %s (%d/12)...", ip, i+1)
-		time.Sleep(10 * time.Second)
-	}
-
+	// Desplegar contenido y configurar Apache
 	apacheConf := fmt.Sprintf(`<VirtualHost *:80>
     ServerName %s.cloud.local
     DocumentRoot %s
@@ -548,34 +691,26 @@ func deployZip(host, ip, zipPath string) error {
     </Directory>
 </VirtualHost>`, host, webRoot, webRoot)
 
-	// Desde web3, hacer deploy a la nueva instancia por red interna
 	deployCmd := fmt.Sprintf(`
-for i in $(seq 1 12); do
-    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 nicolas@%s "echo ok" 2>/dev/null && break
-    sleep 5
-done
-scp -o StrictHostKeyChecking=no /tmp/contenido.zip nicolas@%s:/tmp/contenido.zip
-ssh -o StrictHostKeyChecking=no nicolas@%s "
-    sudo mkdir -p %s &&
-    sudo unzip -o /tmp/contenido.zip -d %s &&
-    sudo chown -R www-data:www-data %s &&
-    sudo tee /etc/apache2/sites-available/%s.conf > /dev/null <<'APACHEEOF'
+sudo mkdir -p %s &&
+sudo unzip -o /tmp/contenido.zip -d %s &&
+sudo chown -R www-data:www-data %s &&
+sudo tee /etc/apache2/sites-available/%s.conf > /dev/null <<'APACHEEOF'
 %s
 APACHEEOF
-    sudo a2ensite %s.conf &&
-    sudo a2dissite 000-default.conf 2>/dev/null || true &&
-    sudo systemctl reload apache2
-"
-`, ip, ip, ip, webRoot, webRoot, webRoot, host, apacheConf, host)
+sudo a2ensite %s.conf &&
+sudo a2dissite 000-default.conf 2>/dev/null || true &&
+sudo systemctl reload apache2
+`, webRoot, webRoot, webRoot, host, apacheConf, host)
 
-	session2, err := web3Client.NewSession()
+	session2, err := client.NewSession()
 	if err != nil {
 		return fmt.Errorf("error creando sesión deploy: %w", err)
 	}
 	out, err := session2.CombinedOutput(deployCmd)
 	session2.Close()
 	if err != nil {
-		return fmt.Errorf("error en deploy desde web3: %s: %w", string(out), err)
+		return fmt.Errorf("error en deploy: %s: %w", string(out), err)
 	}
 
 	log.Printf("[INFO] Contenido desplegado en http://%s.cloud.local", host)
@@ -730,4 +865,36 @@ func EnsureInfrastructure() {
 	// Esperar que los servicios estén listos si se encendieron
 	log.Printf("[INFO] Esperando que los servicios estén listos...")
 	time.Sleep(20 * time.Second)
+}
+
+func DetectVMIPs() {
+	// Obtener IP de ns1
+	out, err := exec.Command("vboxmanage", "guestproperty", "get", "ns1", "/VirtualBox/GuestInfo/Net/1/V4/IP").CombinedOutput()
+	if err == nil {
+		parts := strings.Fields(string(out))
+		if len(parts) >= 2 && parts[0] == "Value:" {
+			NS1_IP = parts[1]
+			log.Printf("[INFO] IP detectada de ns1: %s", NS1_IP)
+		}
+	}
+
+	// Obtener IP de web3
+	out, err = exec.Command("vboxmanage", "guestproperty", "get", "web3", "/VirtualBox/GuestInfo/Net/1/V4/IP").CombinedOutput()
+	if err == nil {
+		parts := strings.Fields(string(out))
+		if len(parts) >= 2 && parts[0] == "Value:" {
+			WEB3_IP = parts[1]
+			log.Printf("[INFO] IP detectada de web3: %s", WEB3_IP)
+		}
+	}
+
+	if NS1_IP == "" || WEB3_IP == "" {
+		log.Printf("[WARN] No se pudieron detectar las IPs automáticamente, usando valores por defecto")
+		if NS1_IP == "" {
+			NS1_IP = "192.168.207.163"
+		}
+		if WEB3_IP == "" {
+			WEB3_IP = "192.168.1.13"
+		}
+	}
 }

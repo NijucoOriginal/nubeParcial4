@@ -7,7 +7,7 @@ HOST="$1"
 IP="$2"
 ACTION="${3:-create}"
 
-TEMPLATE_VM="web1"
+TEMPLATE_VM="web3"
 BASE_DISK_PATH="/home/$(whoami)/VirtualBox VMs/web3/web3-disk1.vdi"  # ajustar si difiere
 VM_NAME="apache-${HOST}"
 INTERNAL_NET="intnet"

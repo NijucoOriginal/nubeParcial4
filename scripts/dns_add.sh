@@ -12,7 +12,7 @@ SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
 echo "[INFO] Registrando ${HOST}.cloud.local → ${IP} en ns1..."
 
-ssh $SSH_OPTS usuario@"$NS1_IP" "
+ssh $SSH_OPTS usuario@"$NS1_IP" "n
     # Incrementar serial (formato: número simple)
     SERIAL=\$(grep -oP '(?<=^\s{0,8})\d{8,}' $ZONE_FILE | head -1)
     NEW_SERIAL=\$(( SERIAL + 1 ))
