@@ -8,6 +8,8 @@ import (
 )
 
 func main() {
+	handlers.EnsureInfrastructure()
+	handlers.LoadIPCounter()
 	mux := http.NewServeMux()
 
 	// Static frontend

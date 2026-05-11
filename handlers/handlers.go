@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"archive/zip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,6 +31,10 @@ const (
 	GATEWAY      = "192.168.10.1"
 	NETMASK      = "255.255.255.0"
 )
+
+const IP_COUNTER_FILE = "/tmp/ip_counter.txt"
+
+var lastIP int
 
 // Ruta al disco .vdi de web3 — ajusta si es diferente
 var BASE_DISK_PATH = `C:\Users\NICOLAS PEÑA RINCON\VirtualBox VMs\web3\web3-disk1.vdi`
@@ -82,17 +85,16 @@ func addLog(level, msg string) {
 // ─── IP allocation ────────────────────────────────────────────────────────────
 
 func nextAvailableIP() (string, error) {
-	used := map[string]bool{}
-	for _, inst := range instances {
-		used[inst.IP] = true
+	lastIP++
+	if lastIP > 254 {
+		return "", fmt.Errorf("no hay IPs disponibles en el rango")
 	}
-	for i := 32; i < 250; i++ {
-		ip := fmt.Sprintf("192.168.10.%d", i)
-		if !used[ip] {
-			return ip, nil
-		}
-	}
-	return "", fmt.Errorf("no hay IPs disponibles en el rango")
+	ip := fmt.Sprintf("192.168.10.%d", lastIP)
+
+	// Guardar el nuevo valor en web3
+	go sshRun(WEB3_IP, WEB3_PORT, fmt.Sprintf("echo %d > %s", lastIP, IP_COUNTER_FILE))
+
+	return ip, nil
 }
 
 // ─── SSH helper ───────────────────────────────────────────────────────────────
@@ -330,12 +332,10 @@ func Provision(w http.ResponseWriter, r *http.Request) {
 func provisionVM(host, ip string) error {
 	vmName := "apache-" + host
 
-	// Crear VM
 	if _, err := vbox("createvm", "--name", vmName, "--ostype", "Debian_64", "--register"); err != nil {
 		return fmt.Errorf("createvm: %w", err)
 	}
 
-	// Configurar hardware — solo red interna
 	if _, err := vbox("modifyvm", vmName,
 		"--memory", "512",
 		"--cpus", "1",
@@ -349,12 +349,10 @@ func provisionVM(host, ip string) error {
 		return fmt.Errorf("modifyvm: %w", err)
 	}
 
-	// Controlador SATA
 	if _, err := vbox("storagectl", vmName, "--name", "SATA Controller", "--add", "sata", "--controller", "IntelAhci"); err != nil {
 		return fmt.Errorf("storagectl: %w", err)
 	}
 
-	// Adjuntar disco multiconexión
 	if _, err := vbox("storageattach", vmName,
 		"--storagectl", "SATA Controller",
 		"--port", "0",
@@ -366,16 +364,45 @@ func provisionVM(host, ip string) error {
 		return fmt.Errorf("storageattach: %w", err)
 	}
 
-	// Arrancar headless
+	// Apagar web3 temporalmente
+	log.Printf("[INFO] Apagando web3 temporalmente...")
+	vbox("controlvm", "web3", "acpipowerbutton")
+	time.Sleep(30 * time.Second)
+
 	if _, err := vbox("startvm", vmName, "--type", "headless"); err != nil {
 		return fmt.Errorf("startvm: %w", err)
 	}
 
-	// Esperar que arranque
 	log.Printf("[INFO] Esperando que '%s' arranque...", vmName)
-	time.Sleep(25 * time.Second)
+	time.Sleep(90 * time.Second)
 
-	// Configurar hostname e IP via SSH a web3 (la nueva VM arranca con la misma IP de web3)
+	// Configurar hostname e IP via túnel ns1 → nueva instancia (red interna)
+	config := &ssh.ClientConfig{
+		User:            SSH_USER,
+		Auth:            []ssh.AuthMethod{ssh.Password("nicolas")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         15 * time.Second,
+	}
+
+	ns1Client, err := ssh.Dial("tcp", NS1_IP+":"+NS1_PORT, config)
+	if err != nil {
+		return fmt.Errorf("error SSH a ns1: %w", err)
+	}
+	defer ns1Client.Close()
+
+	// La nueva VM arrancó con la IP de web3 (192.168.10.30), entramos por ahí
+	vmConn, err := ns1Client.Dial("tcp", "192.168.10.30:22")
+	if err != nil {
+		return fmt.Errorf("error túnel ns1→nueva VM: %w", err)
+	}
+
+	vmNConn, chans, reqs, err := ssh.NewClientConn(vmConn, "192.168.10.30:22", config)
+	if err != nil {
+		return fmt.Errorf("error SSH nueva VM via túnel: %w", err)
+	}
+	vmClient := ssh.NewClient(vmNConn, chans, reqs)
+	defer vmClient.Close()
+
 	configCmd := fmt.Sprintf(`
 sudo hostnamectl set-hostname %s.cloud.local
 sudo tee /etc/network/interfaces > /dev/null <<'EOF'
@@ -385,19 +412,28 @@ auto enp0s3
 iface enp0s3 inet static
     address %s
     netmask %s
-    gateway %s
     dns-nameservers %s
 EOF
 sudo tee /etc/resolv.conf > /dev/null <<'EOF2'
 nameserver %s
 EOF2
-sudo systemctl restart networking
-sudo systemctl restart apache2
-`, host+".cloud.local", ip, NETMASK, GATEWAY, DNS_INTERNAL, DNS_INTERNAL)
+nohup sudo systemctl restart networking > /dev/null 2>&1 &
+nohup sudo systemctl restart apache2 > /dev/null 2>&1 &
+`, host+".cloud.local", ip, NETMASK, DNS_INTERNAL, DNS_INTERNAL)
 
-	if _, err := sshRun(WEB3_IP, WEB3_PORT, configCmd); err != nil {
-		return fmt.Errorf("ssh config: %w", err)
+	session, err := vmClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("error creando sesión en nueva VM: %w", err)
 	}
+	_, err = session.CombinedOutput(configCmd)
+	session.Close()
+	if err != nil {
+		return fmt.Errorf("error configurando nueva VM: %w", err)
+	}
+
+	// Encender web3
+	log.Printf("[INFO] Encendiendo web3...")
+	vbox("startvm", "web3", "--type", "headless")
 
 	return nil
 }
@@ -435,78 +471,74 @@ sudo rndc reload cloud.local
 // ─── Deploy ───────────────────────────────────────────────────────────────────
 
 func deployZip(host, ip, zipPath string) error {
-	// Esperar SSH en la nueva instancia (IP interna)
-	log.Printf("[INFO] Esperando SSH en %s...", ip)
-	var sshReady bool
-	for i := 0; i < 12; i++ {
-		conn, err := net.DialTimeout("tcp", ip+":22", 3*time.Second)
-		if err == nil {
-			conn.Close()
-			sshReady = true
-			break
-		}
-		time.Sleep(5 * time.Second)
-	}
-	if !sshReady {
-		return fmt.Errorf("la instancia %s no respondió SSH en 60s", ip)
-	}
-
-	// Leer zip y extraer index.html y demás archivos
 	webRoot := "/var/www/html/" + host
 
-	// Crear directorio y configurar Apache via SSH
-	setupCmd := fmt.Sprintf(`sudo mkdir -p %s && sudo chown -R www-data:www-data %s`, webRoot, webRoot)
-	if _, err := sshRun(ip, "22", setupCmd); err != nil {
-		return fmt.Errorf("error creando directorio web: %w", err)
-	}
-
-	// Leer y transferir archivos del zip via SSH
-	r, err := zip.OpenReader(zipPath)
+	// Leer el zip localmente
+	zipData, err := os.ReadFile(zipPath)
 	if err != nil {
-		return fmt.Errorf("error abriendo zip: %w", err)
+		return fmt.Errorf("error leyendo zip: %w", err)
 	}
-	defer r.Close()
 
+	// Subir el zip a web3 via NS1 como salto intermedio
+	log.Printf("[INFO] Subiendo zip a web3 via ns1...")
 	config := &ssh.ClientConfig{
 		User:            SSH_USER,
 		Auth:            []ssh.AuthMethod{ssh.Password("nicolas")},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         15 * time.Second,
+		Timeout:         60 * time.Second,
 	}
-	client, err := ssh.Dial("tcp", ip+":22", config)
+
+	// Conectar a ns1
+	ns1Client, err := ssh.Dial("tcp", NS1_IP+":"+NS1_PORT, config)
 	if err != nil {
-		return fmt.Errorf("error SSH a nueva instancia: %w", err)
+		return fmt.Errorf("error SSH a ns1: %w", err)
 	}
-	defer client.Close()
+	defer ns1Client.Close()
 
-	for _, f := range r.File {
-		if f.FileInfo().IsDir() {
-			continue
-		}
-		rc, err := f.Open()
-		if err != nil {
-			continue
-		}
-		content, _ := io.ReadAll(rc)
-		rc.Close()
-
-		destPath := webRoot + "/" + f.Name
-		session, err := client.NewSession()
-		if err != nil {
-			continue
-		}
-		stdin, _ := session.StdinPipe()
-		session.Start(fmt.Sprintf("sudo tee %s > /dev/null", destPath))
-		stdin.Write(content)
-		stdin.Close()
-		session.Wait()
-		session.Close()
+	// Desde ns1, abrir túnel hacia web3 por red interna
+	web3Conn, err := ns1Client.Dial("tcp", "192.168.10.30:22")
+	if err != nil {
+		return fmt.Errorf("error abriendo túnel ns1→web3: %w", err)
 	}
 
-	// Configurar VirtualHost Apache
-	vhostCmd := fmt.Sprintf(`
-sudo tee /etc/apache2/sites-available/%s.conf > /dev/null <<'EOF'
-<VirtualHost *:80>
+	// Crear cliente SSH a web3 usando el túnel
+	web3NConn, chans, reqs, err := ssh.NewClientConn(web3Conn, "192.168.10.30:22", config)
+	if err != nil {
+		return fmt.Errorf("error SSH web3 via túnel: %w", err)
+	}
+	web3Client := ssh.NewClient(web3NConn, chans, reqs)
+	defer web3Client.Close()
+
+	// Copiar zip a web3
+	log.Printf("[INFO] Copiando zip a web3...")
+	session, err := web3Client.NewSession()
+	if err != nil {
+		return fmt.Errorf("error creando sesión en web3: %w", err)
+	}
+	stdin, _ := session.StdinPipe()
+	session.Start("cat > /tmp/contenido.zip")
+	stdin.Write(zipData)
+	stdin.Close()
+	session.Wait()
+	session.Close()
+
+	// Esperar que la nueva instancia aplique su nueva IP
+	log.Printf("[INFO] Esperando que la nueva instancia tome IP %s...", ip)
+	time.Sleep(30 * time.Second)
+
+	// Verificar desde ns1 que la nueva IP ya responde
+	log.Printf("[INFO] Verificando conectividad a %s desde ns1...", ip)
+	for i := 0; i < 12; i++ {
+		out, _ := sshRun(NS1_IP, NS1_PORT, fmt.Sprintf("ping -c 1 -W 2 %s 2>/dev/null && echo OK || echo FAIL", ip))
+		if strings.Contains(out, "OK") {
+			log.Printf("[INFO] Nueva instancia %s responde ping.", ip)
+			break
+		}
+		log.Printf("[INFO] Esperando respuesta de %s (%d/12)...", ip, i+1)
+		time.Sleep(10 * time.Second)
+	}
+
+	apacheConf := fmt.Sprintf(`<VirtualHost *:80>
     ServerName %s.cloud.local
     DocumentRoot %s
     <Directory %s>
@@ -514,17 +546,39 @@ sudo tee /etc/apache2/sites-available/%s.conf > /dev/null <<'EOF'
         AllowOverride All
         Require all granted
     </Directory>
-</VirtualHost>
-EOF
-sudo a2ensite %s.conf
-sudo a2dissite 000-default.conf 2>/dev/null || true
-sudo systemctl reload apache2
-`, host, host, webRoot, webRoot, host)
+</VirtualHost>`, host, webRoot, webRoot)
 
-	if _, err := sshRun(ip, "22", vhostCmd); err != nil {
-		return fmt.Errorf("error configurando Apache: %w", err)
+	// Desde web3, hacer deploy a la nueva instancia por red interna
+	deployCmd := fmt.Sprintf(`
+for i in $(seq 1 12); do
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 nicolas@%s "echo ok" 2>/dev/null && break
+    sleep 5
+done
+scp -o StrictHostKeyChecking=no /tmp/contenido.zip nicolas@%s:/tmp/contenido.zip
+ssh -o StrictHostKeyChecking=no nicolas@%s "
+    sudo mkdir -p %s &&
+    sudo unzip -o /tmp/contenido.zip -d %s &&
+    sudo chown -R www-data:www-data %s &&
+    sudo tee /etc/apache2/sites-available/%s.conf > /dev/null <<'APACHEEOF'
+%s
+APACHEEOF
+    sudo a2ensite %s.conf &&
+    sudo a2dissite 000-default.conf 2>/dev/null || true &&
+    sudo systemctl reload apache2
+"
+`, ip, ip, ip, webRoot, webRoot, webRoot, host, apacheConf, host)
+
+	session2, err := web3Client.NewSession()
+	if err != nil {
+		return fmt.Errorf("error creando sesión deploy: %w", err)
+	}
+	out, err := session2.CombinedOutput(deployCmd)
+	session2.Close()
+	if err != nil {
+		return fmt.Errorf("error en deploy desde web3: %s: %w", string(out), err)
 	}
 
+	log.Printf("[INFO] Contenido desplegado en http://%s.cloud.local", host)
 	return nil
 }
 
@@ -620,4 +674,60 @@ func DeleteInstance(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusNotFound, map[string]string{"error": "instancia no encontrada"})
+}
+
+func LoadIPCounter() {
+	out, err := sshRun(WEB3_IP, WEB3_PORT, "cat "+IP_COUNTER_FILE+" 2>/dev/null || echo 30")
+	if err != nil {
+		log.Printf("[WARN] No se pudo leer contador IP, empezando en 30: %v", err)
+		lastIP = 30
+		return
+	}
+	val := strings.TrimSpace(out)
+	n := 30
+	fmt.Sscanf(val, "%d", &n)
+	lastIP = n
+	log.Printf("[INFO] Contador IP cargado: siguiente será 192.168.10.%d", lastIP+1)
+}
+
+func EnsureInfrastructure() {
+	log.Printf("[INFO] Verificando infraestructura...")
+
+	// Obtener lista de VMs corriendo
+	out, err := exec.Command("vboxmanage", "list", "runningvms").CombinedOutput()
+	if err != nil {
+		log.Printf("[WARN] No se pudo verificar VMs corriendo: %v", err)
+		return
+	}
+	running := string(out)
+
+	// Verificar y encender ns1
+	if !strings.Contains(running, "\"ns\"") {
+		log.Printf("[INFO] ns1 no está corriendo, encendiendo...")
+		_, err := vbox("startvm", "ns", "--type", "headless")
+		if err != nil {
+			log.Printf("[WARN] No se pudo encender ns: %v", err)
+		} else {
+			log.Printf("[INFO] ns encendida.")
+		}
+	} else {
+		log.Printf("[INFO] ns ya está corriendo.")
+	}
+
+	// Verificar y encender web3
+	if !strings.Contains(running, "\"web3\"") {
+		log.Printf("[INFO] web3 no está corriendo, encendiendo...")
+		_, err := vbox("startvm", "web3", "--type", "headless")
+		if err != nil {
+			log.Printf("[WARN] No se pudo encender web3: %v", err)
+		} else {
+			log.Printf("[INFO] web3 encendida.")
+		}
+	} else {
+		log.Printf("[INFO] web3 ya está corriendo.")
+	}
+
+	// Esperar que los servicios estén listos si se encendieron
+	log.Printf("[INFO] Esperando que los servicios estén listos...")
+	time.Sleep(20 * time.Second)
 }
